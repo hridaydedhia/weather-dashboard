@@ -5,6 +5,9 @@
  * Phase 3A: API Integration and Application Foundation
  * Phase 3B: Weather Data Processing and DOM Rendering
  * Phase 3C.1: Celsius / Fahrenheit Unit Switching
+ * Phase 3C.2: Recent Searches Using localStorage
+ * Phase 3C.3: Use My Location / Browser Geolocation
+ * Phase 3C.4: Dynamic Weather and Day/Night Theming
  *
  * API: Open-Meteo (no API key required)
  * Language: Vanilla ES6+ JavaScript (fetch, async/await)
@@ -16,15 +19,21 @@
 
 const searchForm        = document.getElementById('search-form');
 const cityInput         = document.getElementById('city-search-input');
+const searchSubmitBtn   = document.getElementById('search-submit-btn');
 
 const loadingIndicator  = document.getElementById('loading-indicator');
 
 const errorContainer    = document.getElementById('error-container');
 const errorMessageEl    = document.getElementById('error-message');
 
-// Unit switcher buttons
+// Header control buttons
+const geolocationBtn    = document.getElementById('geolocation-btn');
 const unitCelsiusBtn    = document.getElementById('unit-celsius-btn');
 const unitFahrenheitBtn = document.getElementById('unit-fahrenheit-btn');
+
+// Recent searches section and container
+const recentSearchesSection   = document.getElementById('recent-searches-section');
+const recentSearchesContainer = document.getElementById('recent-searches-container');
 
 // Current weather display elements
 const currentCityEl       = document.getElementById('current-city');
@@ -45,13 +54,20 @@ const forecastContainer     = document.getElementById('forecast-container');
 const forecastCardTemplate  = document.getElementById('forecast-card-template');
 
 /* ==========================================================================
-   2. API Configuration
+   2. API & Storage Configuration
    ========================================================================== */
 
 const API = {
     geocoding: 'https://geocoding-api.open-meteo.com/v1/search',
     weather:   'https://api.open-meteo.com/v1/forecast',
+    reverse:   'https://api.bigdatacloud.net/data/reverse-geocode-client',
 };
+
+const STORAGE_KEYS = {
+    recentSearches: 'weatherRecentSearches',
+};
+
+const MAX_RECENT_SEARCHES = 5;
 
 /**
  * Weather variables requested from the Open-Meteo forecast endpoint.
@@ -85,18 +101,22 @@ const WEATHER_PARAMS = {
  * Central application state.
  *
  * - unit: Active temperature unit ('celsius' | 'fahrenheit'). Defaults to 'celsius'.
- * - location: Geocoded location object from Open-Meteo.
+ * - location: Geocoded location object from Open-Meteo or reverse geocoding.
  * - weather: Complete raw forecast API response (temperatures stored in Celsius).
+ * - recentSearches: Array of recent location objects [{ name, country }, ...]
  */
 const state = {
     /** Active temperature unit: 'celsius' | 'fahrenheit' */
     unit: 'celsius',
 
-    /** Geocoded location info from the geocoding API */
+    /** Geocoded location info from geocoding service */
     location: null,
 
     /** Full weather response from the forecast API (kept in Celsius) */
     weather: null,
+
+    /** Stored list of up to 5 recent searches */
+    recentSearches: [],
 };
 
 /* ==========================================================================
@@ -105,6 +125,11 @@ const state = {
 
 // Search form submit (handles both Search button click and Enter key press)
 searchForm.addEventListener('submit', handleSearch);
+
+// Geolocation button
+if (geolocationBtn) {
+    geolocationBtn.addEventListener('click', handleGeolocation);
+}
 
 // Temperature unit switcher buttons
 unitCelsiusBtn.addEventListener('click', () => setUnit('celsius'));
@@ -216,50 +241,222 @@ function setUnit(newUnit) {
 }
 
 /* ==========================================================================
-   6. Search / Input Handling
+   6. Recent Searches (localStorage & State Management)
+   ========================================================================== */
+
+/**
+ * loadRecentSearchesFromStorage()
+ *
+ * Safely loads and parses the recent searches array from localStorage.
+ * Handles missing keys and corrupt JSON gracefully by returning an empty array.
+ *
+ * @returns {Array<Object>} - Array of { name: string, country: string }
+ */
+function loadRecentSearchesFromStorage() {
+    try {
+        const stored = localStorage.getItem(STORAGE_KEYS.recentSearches);
+        if (!stored) {
+            return [];
+        }
+        const parsed = JSON.parse(stored);
+        return Array.isArray(parsed) ? parsed : [];
+    } catch (error) {
+        console.warn('⚠️ Unable to load recent searches from localStorage:', error);
+        return [];
+    }
+}
+
+/**
+ * saveRecentSearchesToStorage()
+ *
+ * Safely persists the recent searches array to localStorage.
+ * Fails gracefully if storage quota is exceeded or storage is disabled.
+ *
+ * @param {Array<Object>} searches - Array of location objects to persist
+ */
+function saveRecentSearchesToStorage(searches) {
+    try {
+        localStorage.setItem(STORAGE_KEYS.recentSearches, JSON.stringify(searches));
+    } catch (error) {
+        console.warn('⚠️ Unable to save recent searches to localStorage:', error);
+    }
+}
+
+/**
+ * addRecentSearch()
+ *
+ * Adds a geocoded location to recent searches:
+ * - Uses the geocoded location's name and country.
+ * - Case-insensitive deduplication: if already present, removes the old entry first.
+ * - Appends the new entry to the end (most recent).
+ * - Caps the list at MAX_RECENT_SEARCHES (5), dropping the oldest.
+ * - Saves to localStorage and updates DOM.
+ *
+ * @param {Object} location - Geocoded location object { name: string, country: string }
+ */
+function addRecentSearch(location) {
+    if (!location || !location.name || location.name === 'Your Location') {
+        return;
+    }
+
+    const newEntry = {
+        name:    location.name,
+        country: location.country || '',
+    };
+
+    // Normalized key for duplicate detection: "name|country" in lower case
+    const normalize = (item) =>
+        `${(item.name || '').trim().toLowerCase()}|${(item.country || '').trim().toLowerCase()}`;
+
+    const targetKey = normalize(newEntry);
+
+    // Remove any existing entry matching the same normalized location
+    const updated = state.recentSearches.filter((item) => normalize(item) !== targetKey);
+
+    // Add the new location at the end (newest)
+    updated.push(newEntry);
+
+    // Keep only the last 5 entries (dropping the oldest from the front)
+    if (updated.length > MAX_RECENT_SEARCHES) {
+        updated.splice(0, updated.length - MAX_RECENT_SEARCHES);
+    }
+
+    state.recentSearches = updated;
+    saveRecentSearchesToStorage(updated);
+    renderRecentSearches();
+}
+
+/**
+ * renderRecentSearches()
+ *
+ * Renders the recent search chips:
+ * - If recentSearches is empty, hides #recent-searches-section.
+ * - If searches exist, displays the section and builds accessible chip buttons.
+ * - Uses document.createElement() and textContent to prevent XSS.
+ * - Each button triggers searchCity() when clicked.
+ */
+function renderRecentSearches() {
+    if (!recentSearchesContainer || !recentSearchesSection) {
+        return;
+    }
+
+    // Clear existing chip elements
+    recentSearchesContainer.innerHTML = '';
+
+    // If no recent searches, hide the section
+    if (!state.recentSearches || state.recentSearches.length === 0) {
+        recentSearchesSection.setAttribute('hidden', '');
+        return;
+    }
+
+    // Reveal the section
+    recentSearchesSection.removeAttribute('hidden');
+
+    // Create chip button for each search
+    state.recentSearches.forEach((search) => {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'btn btn-chip';
+
+        // City name
+        const nameSpan = document.createElement('span');
+        nameSpan.className = 'chip-name';
+        nameSpan.textContent = search.name;
+        btn.appendChild(nameSpan);
+
+        // Optional subtle country indicator
+        if (search.country) {
+            const countrySpan = document.createElement('span');
+            countrySpan.className = 'chip-country';
+            countrySpan.textContent = search.country;
+            btn.appendChild(countrySpan);
+        }
+
+        const fullLabel = search.country
+            ? `${search.name}, ${search.country}`
+            : search.name;
+        btn.setAttribute('aria-label', `Search weather for ${fullLabel}`);
+
+        // Clicking the chip triggers the search flow
+        btn.addEventListener('click', () => {
+            searchCity(search.name);
+        });
+
+        recentSearchesContainer.appendChild(btn);
+    });
+}
+
+/* ==========================================================================
+   7. Search / Input Handling
    ========================================================================== */
 
 /**
  * handleSearch()
  *
- * Entry point for a user-initiated weather search.
- * Orchestrates the full data-fetch and rendering flow:
- *   validate -> geocode -> fetch weather -> store in state -> render UI
+ * Form submit handler for the city search form.
+ * Reads the input value and initiates searchCity().
  *
  * @param {Event} event - The form submit event
  */
 async function handleSearch(event) {
-    // 1. Prevent the browser's default form submission (page reload)
     event.preventDefault();
-
-    // 2. Read and sanitize the city input
     const city = cityInput.value.trim();
 
-    // 3. Validate: do not proceed if input is empty
     if (!city) {
         showError('Please enter a city name before searching.');
         return;
     }
 
-    // 4. Reset any previous error and show the loading indicator
+    await searchCity(city);
+}
+
+/**
+ * searchCity()
+ *
+ * Unified weather search flow shared by manual search and recent search chips:
+ *   1. Updates input field value
+ *   2. Validates input
+ *   3. Shows loading & clears error
+ *   4. Geocodes city to coordinates
+ *   5. Fetches weather data
+ *   6. Stores in application state
+ *   7. Renders weather to DOM
+ *   8. Adds location to recent searches
+ *
+ * @param {string} cityName - The city name to search for
+ */
+async function searchCity(cityName) {
+    const city = (cityName || '').trim();
+
+    if (!city) {
+        showError('Please enter a city name before searching.');
+        return;
+    }
+
+    // Reflect the selected city in the search input
+    cityInput.value = city;
+
+    // Reset error state and display loading spinner
     hideError();
     showLoading();
 
     try {
-        // 5. Step 1 — Geocode the city name to coordinates
+        // Step 1 — Geocode the city name to coordinates
         const location = await getLocationCoordinates(city);
 
-        // 6. Step 2 — Fetch weather data using the resolved coordinates
+        // Step 2 — Fetch weather data using the resolved coordinates
         const weather = await getWeatherData(location.latitude, location.longitude);
 
-        // 7. Persist results into application state
+        // Step 3 — Persist results into application state
         state.location = location;
         state.weather  = weather;
 
-        // 8. Render all weather data into the DOM
+        // Step 4 — Render all weather data into the DOM
         renderWeather();
 
-        // 9. Log a concise summary for verification during development
+        // Step 5 — Save location to recent searches
+        addRecentSearch(location);
+
         console.log('✅ Weather data retrieved and rendered:', {
             location: state.location,
             unit:     state.unit,
@@ -268,17 +465,15 @@ async function handleSearch(event) {
         });
 
     } catch (error) {
-        // Surface meaningful error messages to the user
         showError(error.message);
         console.error('❌ Search failed:', error);
     } finally {
-        // Always hide the loading indicator regardless of success or failure
         hideLoading();
     }
 }
 
 /* ==========================================================================
-   7. Geocoding Service (Open-Meteo Geocoding API)
+   8. Geocoding Service (Open-Meteo Geocoding API)
    ========================================================================== */
 
 /**
@@ -326,7 +521,7 @@ async function getLocationCoordinates(cityName) {
 }
 
 /* ==========================================================================
-   8. Weather Service (Open-Meteo Forecast API)
+   9. Weather Service (Open-Meteo Forecast API)
    ========================================================================== */
 
 /**
@@ -364,7 +559,7 @@ async function getWeatherData(latitude, longitude) {
 }
 
 /* ==========================================================================
-   9. UI Feedback State Management
+   10. UI Feedback State Management
    ========================================================================== */
 
 /**
@@ -372,12 +567,17 @@ async function getWeatherData(latitude, longitude) {
  *
  * Activates the loading state:
  * - Unhides the #loading-indicator element
- * - Disables the search submit button and input to prevent duplicate requests
+ * - Disables the search submit button, input, and geolocation button
  */
 function showLoading() {
     loadingIndicator.removeAttribute('hidden');
     cityInput.setAttribute('disabled', '');
-    document.getElementById('search-submit-btn').setAttribute('disabled', '');
+    if (searchSubmitBtn) {
+        searchSubmitBtn.setAttribute('disabled', '');
+    }
+    if (geolocationBtn) {
+        geolocationBtn.setAttribute('disabled', '');
+    }
 }
 
 /**
@@ -385,12 +585,17 @@ function showLoading() {
  *
  * Deactivates the loading state:
  * - Hides the #loading-indicator element
- * - Re-enables the search submit button and input
+ * - Re-enables the search submit button, input, and geolocation button
  */
 function hideLoading() {
     loadingIndicator.setAttribute('hidden', '');
     cityInput.removeAttribute('disabled');
-    document.getElementById('search-submit-btn').removeAttribute('disabled');
+    if (searchSubmitBtn) {
+        searchSubmitBtn.removeAttribute('disabled');
+    }
+    if (geolocationBtn) {
+        geolocationBtn.removeAttribute('disabled');
+    }
 }
 
 /**
@@ -416,19 +621,26 @@ function hideError() {
 }
 
 /* ==========================================================================
-   10. Application Initialization
+   11. Application Initialization
    ========================================================================== */
 
 /**
  * init()
  *
  * Runs once when the script loads (deferred, DOM ready).
- * The dashboard starts in its default placeholder state with Celsius selected.
+ * 1. Resets loading and error states
+ * 2. Initializes unit switcher button state
+ * 3. Safely loads recent searches from localStorage and renders them
  */
 function init() {
     hideLoading();
     hideError();
     updateUnitButtons();
+
+    // Restore recent searches from localStorage (if any)
+    state.recentSearches = loadRecentSearchesFromStorage();
+    renderRecentSearches();
+
     console.log('🌤 Weather Dashboard initialized. Unit set to °C. Waiting for user search.');
 }
 
@@ -436,11 +648,248 @@ function init() {
 init();
 
 /* ==========================================================================
-   11. Weather Data Processing & Rendering
+   12. Geolocation (Browser GPS & Reverse Geocoding)
+   ========================================================================== */
+
+/**
+ * getCurrentPosition()
+ *
+ * Promisified wrapper around native navigator.geolocation.getCurrentPosition().
+ * Requests the device's location once.
+ *
+ * @param   {PositionOptions} [options] - Geolocation options
+ * @returns {Promise<GeolocationPosition>}
+ */
+function getCurrentPosition(options = { timeout: 10000, enableHighAccuracy: true }) {
+    return new Promise((resolve, reject) => {
+        if (!navigator.geolocation) {
+            reject(new Error('Geolocation is not supported by this browser. Please search for a city manually.'));
+            return;
+        }
+
+        navigator.geolocation.getCurrentPosition(resolve, reject, options);
+    });
+}
+
+/**
+ * getLocationFromCoordinates()
+ *
+ * Resolves geographic coordinates to a human-readable city/location name.
+ * Uses a free client reverse-geocoding service.
+ * If reverse geocoding is unavailable or cannot determine a city,
+ * falls back safely to "Your Location" to ensure the application never crashes.
+ *
+ * @param   {number} latitude  - Latitude coordinate
+ * @param   {number} longitude - Longitude coordinate
+ * @returns {Promise<Object>}  - Compatible state.location object
+ */
+async function getLocationFromCoordinates(latitude, longitude) {
+    const fallbackLocation = {
+        name:      'Your Location',
+        country:   '',
+        latitude:  latitude,
+        longitude: longitude,
+        timezone:  'auto',
+    };
+
+    try {
+        const url = new URL(API.reverse);
+        url.searchParams.set('latitude', latitude);
+        url.searchParams.set('longitude', longitude);
+        url.searchParams.set('localityLanguage', 'en');
+
+        const response = await fetch(url.toString());
+        if (!response.ok) {
+            return fallbackLocation;
+        }
+
+        const data = await response.json();
+        const cityName = data.city || data.locality || data.principalSubdivision || '';
+        const countryName = data.countryName || '';
+
+        if (!cityName) {
+            return fallbackLocation;
+        }
+
+        return {
+            name:      cityName,
+            country:   countryName,
+            latitude:  latitude,
+            longitude: longitude,
+            timezone:  'auto',
+        };
+    } catch (error) {
+        console.warn('⚠️ Reverse geocoding unavailable, using fallback:', error);
+        return fallbackLocation;
+    }
+}
+
+/**
+ * handleGeolocationError()
+ *
+ * Maps GeolocationPositionError codes to clear, friendly user messages.
+ *
+ * @param   {GeolocationPositionError|Error} error
+ * @returns {string} - Human-readable error description
+ */
+function handleGeolocationError(error) {
+    if (!error) {
+        return 'An unknown error occurred while retrieving your location.';
+    }
+
+    // Standard GeolocationPositionError error codes
+    switch (error.code) {
+        case 1: // PERMISSION_DENIED
+            return 'Location access was denied. Please allow location access or search for a city manually.';
+        case 2: // POSITION_UNAVAILABLE
+            return 'Your location could not be determined. Please try again or search for a city.';
+        case 3: // TIMEOUT
+            return 'Location request timed out. Please try again.';
+        default:
+            return error.message || 'An error occurred while retrieving your location. Please try searching manually.';
+    }
+}
+
+/**
+ * handleGeolocation()
+ *
+ * Dedicated click handler for the "Use My Location" button:
+ *   1. Shows loading indicator and disables action buttons
+ *   2. Requests user coordinates via navigator.geolocation
+ *   3. Resolves coordinates to location name via reverse geocoding
+ *   4. Reuses getWeatherData() to fetch live atmospheric data
+ *   5. Updates state.location and state.weather
+ *   6. Re-renders UI (preserving active °C/°F unit selection)
+ *   7. Updates search input & adds to recent searches if valid city
+ *   8. Handles all permission and device errors gracefully
+ */
+async function handleGeolocation() {
+    hideError();
+    showLoading();
+
+    try {
+        // Step 1: Request browser coordinates once
+        const position = await getCurrentPosition();
+        const { latitude, longitude } = position.coords;
+
+        // Step 2: Concurrently resolve location name and fetch weather data
+        const [location, weather] = await Promise.all([
+            getLocationFromCoordinates(latitude, longitude),
+            getWeatherData(latitude, longitude),
+        ]);
+
+        // If location timezone was fallback 'auto', update with timezone from weather data
+        if (weather.timezone && weather.timezone !== 'auto') {
+            location.timezone = weather.timezone;
+        }
+
+        // Step 3: Persist into application state
+        state.location = location;
+        state.weather  = weather;
+
+        // Step 4: Render weather to DOM using existing renderer (preserves active unit)
+        renderWeather();
+
+        // Step 5: Update search input & recent searches only if real named city resolved
+        if (location.name && location.name !== 'Your Location') {
+            cityInput.value = location.name;
+            addRecentSearch(location);
+        } else {
+            cityInput.value = '';
+        }
+
+        console.log('✅ Geolocation weather retrieved and rendered:', {
+            location: state.location,
+            unit:     state.unit,
+            coords:   { latitude, longitude },
+        });
+
+    } catch (error) {
+        const message = handleGeolocationError(error);
+        showError(message);
+        console.error('❌ Geolocation error:', error);
+    } finally {
+        hideLoading();
+    }
+}
+
+/* ==========================================================================
+   13. Dynamic Weather Theming
+   ========================================================================== */
+
+/**
+ * getWeatherThemeCategory()
+ *
+ * Maps Open-Meteo WMO weather codes into atmospheric theme categories:
+ * - 'clear': WMO 0, 1 (Clear, Mainly Clear)
+ * - 'cloudy': WMO 2, 3 (Partly Cloudy, Overcast)
+ * - 'fog': WMO 45, 48 (Fog, Icy Fog)
+ * - 'rain': WMO 51-67, 80-82 (Drizzle, Rain, Rain Showers)
+ * - 'snow': WMO 71-77, 85-86 (Snowfall, Snow Grains, Snow Showers)
+ * - 'storm': WMO 95-99 (Thunderstorms)
+ *
+ * @param   {number} code - WMO weather interpretation code
+ * @returns {string}      - Theme category name ('clear', 'cloudy', 'fog', 'rain', 'snow', 'storm')
+ */
+function getWeatherThemeCategory(code) {
+    if (code === 0 || code === 1) {
+        return 'clear';
+    }
+    if (code === 2 || code === 3) {
+        return 'cloudy';
+    }
+    if (code === 45 || code === 48) {
+        return 'fog';
+    }
+    if (
+        (code >= 51 && code <= 67) ||
+        (code >= 80 && code <= 82)
+    ) {
+        return 'rain';
+    }
+    if (
+        (code >= 71 && code <= 77) ||
+        code === 85 ||
+        code === 86
+    ) {
+        return 'snow';
+    }
+    if (code >= 95 && code <= 99) {
+        return 'storm';
+    }
+    return 'clear';
+}
+
+/**
+ * applyWeatherTheme()
+ *
+ * Dynamically selects and applies an atmospheric theme based on:
+ *   1. state.weather.current.weather_code (clear, cloudy, fog, rain, snow, storm)
+ *   2. state.weather.current.is_day (1 = day, 0 = night)
+ *
+ * Sets document.documentElement.dataset.theme = `${dayOrNight}-${category}`.
+ * The visual appearance is governed completely by CSS custom properties in styles.css.
+ */
+function applyWeatherTheme() {
+    if (!state.weather || !state.weather.current) {
+        return;
+    }
+
+    const { weather_code, is_day } = state.weather.current;
+    const category = getWeatherThemeCategory(weather_code);
+    const dayOrNight = is_day === 1 ? 'day' : 'night';
+    const themeName = `${dayOrNight}-${category}`;
+
+    document.documentElement.dataset.theme = themeName;
+    console.log(`🎨 Applied weather theme: "${themeName}" (WMO: ${weather_code}, is_day: ${is_day})`);
+}
+
+/* ==========================================================================
+   14. Weather Data Processing & Rendering
    ========================================================================== */
 
 /* --------------------------------------------------------------------------
-   11a. WMO Weather Code Mapping
+   14a. WMO Weather Code Mapping
    -------------------------------------------------------------------------- */
 
 /**
@@ -498,7 +947,7 @@ function getWeatherInfo(code, isDay) {
 }
 
 /* --------------------------------------------------------------------------
-   11b. Icon Rendering
+   13b. Icon Rendering
    -------------------------------------------------------------------------- */
 
 /**
@@ -529,7 +978,7 @@ function createWeatherIconSrc(emoji, size = 64) {
 }
 
 /* --------------------------------------------------------------------------
-   11c. Date Formatting
+   13c. Date Formatting
    -------------------------------------------------------------------------- */
 
 /**
@@ -580,7 +1029,7 @@ function formatForecastDate(dateStr) {
 }
 
 /* --------------------------------------------------------------------------
-   11d. Rendering Functions
+   13d. Rendering Functions
    -------------------------------------------------------------------------- */
 
 /**
@@ -591,6 +1040,7 @@ function formatForecastDate(dateStr) {
  * metrics, and 5-day forecast.
  */
 function renderWeather() {
+    applyWeatherTheme();
     renderCurrentWeather();
     renderWeatherMetrics();
     renderForecast();

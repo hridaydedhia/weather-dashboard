@@ -8,6 +8,7 @@
  * Phase 3C.2: Recent Searches Using localStorage
  * Phase 3C.3: Use My Location / Browser Geolocation
  * Phase 3C.4: Dynamic Weather and Day/Night Theming
+ * Phase 3C.5: Final Micro-Interactions and UI Polish
  *
  * API: Open-Meteo (no API key required)
  * Language: Vanilla ES6+ JavaScript (fetch, async/await)
@@ -1142,6 +1143,12 @@ function renderForecast() {
     daily.time.forEach((dateStr, index) => {
         // 3. Clone the <template> content
         const clone = forecastCardTemplate.content.cloneNode(true);
+
+        // Assign staggered entrance animation delay (50ms per card)
+        const cardArticle = clone.querySelector('.forecast-card');
+        if (cardArticle) {
+            cardArticle.style.setProperty('--reveal-delay', `${index * 50}ms`);
+        }
 
         // 4. Locate elements inside the cloned fragment
         const dayEl       = clone.querySelector('.forecast-day');
